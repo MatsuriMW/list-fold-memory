@@ -384,7 +384,8 @@ module.exports = class ListFoldMemory extends Plugin {
 			StateField.define({
 				create: build,
 				update: (val, tr) => (tr.docChanged || tr.effects.some((e) => e.is(refresh)) ? build(tr.state) : val),
-				provide: (f) => EditorView.decorations.from(f),
+				// 藏起来的标记行也当成一个原子：光标直接跳过，不可能停进去把它打坏
+				provide: (f) => [EditorView.decorations.from(f), EditorView.atomicRanges.of((view) => view.state.field(f))],
 			}),
 			...this.foldSyncExtension(),
 		];
