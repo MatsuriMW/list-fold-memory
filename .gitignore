@@ -1,0 +1,5 @@
+.DS_Store
+data.json
+ai-usage.json
+game-log.json
+node_modules/

@@ -1,0 +1,74 @@
+/*
+ * 折叠之后留在原地的小标记：⋯ 3 这样，点一下展开
+ * 展开着的项尾巴上那个折叠按钮平时透明，鼠标划到那一行才出来
+ */
+
+/* 折叠占位（编辑器里是块级，阅读视图里是插在 li 里的小块） */
+.lf-collapse-marker {
+	display: flex;
+	align-items: center;
+	gap: 3px;
+	width: fit-content;
+	padding: 0 6px 0 5px;
+	margin: 1px 0;
+	border-radius: 6px;
+	font-size: 0.85em;
+	line-height: 1.7;
+	color: var(--text-muted);
+	background: var(--background-modifier-hover);
+	cursor: pointer;
+	user-select: none;
+}
+
+.lf-collapse-marker:hover {
+	color: var(--text-normal);
+	background: var(--background-modifier-active-hover);
+}
+
+.lf-collapse-marker .lf-count {
+	font-variant-numeric: tabular-nums;
+	opacity: 0.75;
+}
+
+/* 展开着的项：鼠标划过时才冒出来的折叠按钮，不占地方 */
+.lf-collapse-handle {
+	margin-left: 6px;
+	padding: 0 5px;
+	border-radius: 5px;
+	font-size: 0.8em;
+	line-height: 1.5;
+	color: var(--text-faint);
+	background: var(--background-modifier-hover);
+	cursor: pointer;
+	user-select: none;
+	opacity: 0;
+	transition: opacity 0.1s ease-in-out;
+}
+
+.cm-line:hover .lf-collapse-handle {
+	opacity: 1;
+}
+
+.lf-collapse-handle:hover {
+	color: var(--text-normal);
+	background: var(--background-modifier-active-hover);
+}
+
+/* 阅读视图：收起来的项，子列表整个不见 */
+.markdown-preview-view li.lf-li-collapsed > ul,
+.markdown-preview-view li.lf-li-collapsed > ol,
+.markdown-rendered li.lf-li-collapsed > ul,
+.markdown-rendered li.lf-li-collapsed > ol {
+	display: none;
+}
+
+/* 阅读视图：展开着的项，那个折叠按钮平时藏起来，鼠标划到这一项才出来 */
+.markdown-preview-view .lf-collapse-marker.lf-idle,
+.markdown-rendered .lf-collapse-marker.lf-idle {
+	display: none;
+}
+
+.markdown-preview-view li:hover > .lf-collapse-marker.lf-idle,
+.markdown-rendered li:hover > .lf-collapse-marker.lf-idle {
+	display: flex;
+}
