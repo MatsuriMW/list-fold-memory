@@ -26,6 +26,17 @@ The marker sits one indent level in, right under the item it belongs to — the 
 
 Nothing else about your note changes.
 
+## How it folds
+
+The folding itself is not drawn by this plugin — it calls the same CodeMirror fold that ⌥S uses. What you get is Obsidian's own: the arrow at the left of the line, the `…` at the end of it, the same click to unfold. Nothing about the fold looks foreign.
+
+Marker and fold are kept in sync in both directions:
+
+- A marker in the file folds that item when the note opens.
+- Fold something yourself — ⌥S, the arrow at the left, whatever you already use — and the marker is written for you. Unfold it and the marker is removed.
+
+So the plugin's own button is optional. Fold the way you already do, and the state is kept anyway.
+
 ## Why the state lives in the file
 
 The obvious design is a JSON file in the plugin folder, with each list item identified by its line number or by a hash of its text. Both fall apart on a note that something else keeps rewriting:
@@ -53,7 +64,7 @@ Bind any of them to a hotkey in **Settings → Hotkeys**.
 | Setting | Default | What it does |
 |---|---|---|
 | 鼠标划过时显示折叠按钮 | On | An item that is unfolded grows a small collapse button at the end of its line while the mouse is over it. Nothing shows otherwise |
-| 标记上显示后代条数 | On | Show `⋯ 3` instead of just `⋯`, counting everything hidden inside |
+| 折叠按钮上显示后代条数 | On | Show `⌄ 3` instead of just `⌄`, counting everything inside. The `…` shown once folded is Obsidian's own and cannot be changed |
 | 阅读视图也折叠 | On | Honour the markers in Reading view, with a clickable marker to unfold |
 | 源码模式下也折叠 | Off | Source mode hides the marker either way; turn this on to fold the list there too |
 | 临时露出折叠标记 | Off | Show the marker lines as plain text for checking. Same as the command |
