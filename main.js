@@ -388,8 +388,16 @@ module.exports = class ListFoldMemory extends Plugin {
 		return [ViewPlugin.fromClass(class {
 			constructor(view) {
 				this.seen = new Set();
-				// 打开笔记：按文件里的标记把该折的折上
-				setTimeout(() => { this.seen = plugin.foldedLines(view); plugin.applyFolds(view); }, 0);
+				// 打开笔记：按文件里的标记把该折的折上。
+				// 视图刚建好时 live preview 的 StateField 有时还没就绪，applyFolds 会以为在源码模式直接返回，
+				// 所以下一帧再补一次，半秒后再兜一次（源码模式那两次都会安全地什么都不做）
+				const run = () => {
+					if (!view.dom || !view.dom.isConnected) return;
+					this.seen = plugin.foldedLines(view);
+					plugin.applyFolds(view);
+				};
+				setTimeout(run, 0);
+				setTimeout(run, 500);
 			}
 			update(u) {
 				// 打字会让行号整体挪位，这时候看到的「折叠变了」不算数，重新记一份就好
@@ -433,6 +441,10 @@ module.exports = class ListFoldMemory extends Plugin {
 		const file = state.field(editorInfoField, false)?.file;
 		if (!file) return;
 		const wantFold = !!state.field(editorLivePreviewField, false) || this.settings.sourceFold;
+		// 源码模式（没开「源码模式下也折叠」）：不折也不展开，标记留着只由装饰藏起来。
+		// 以前这里会按 wantFold=false 把已折的项展开，再经 noteFoldLine 把标记写没；
+		// 视图刚建好、live preview 还没就绪的那一瞬也会被误判成源码模式，标记就这样丢了。
+		if (!wantFold) return;
 		const items = this.doc(file, state.doc.toString()).items;
 		const targets = items.filter((it) => it.childCount && !ancestorFolded(it));
 		if (!targets.length) return;
