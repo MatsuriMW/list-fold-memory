@@ -44,7 +44,7 @@ jobs:
             echo
             git log --no-merges --format='- %s' $range | sed -E 's/ *#(minor|major)[[:space:]]*$//'
             echo
-            echo "Install: download \`main.js\`, \`manifest.json\` and \`styles.css\` into \`<vault>/.obsidian/plugins/nautilus-spiral/\`, or use BRAT."
+            echo "Install: download \`main.js\`, \`manifest.json\` and \`styles.css\` into \`<vault>/.obsidian/plugins/list-fold-memory/\`, or use BRAT (MatsuriMW/list-fold-memory)."
           } > notes.md
           cat notes.md
 
