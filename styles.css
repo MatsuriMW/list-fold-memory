@@ -72,3 +72,14 @@
 .markdown-rendered li:hover > .lf-collapse-marker.lf-idle {
 	display: flex;
 }
+
+/* 折叠标记行：用零高度藏起来，避免 block replace 把列表结构合坏 */
+.cm-line.lf-attr-hidden {
+	font-size: 0 !important;
+	line-height: 0 !important;
+	height: 0 !important;
+	min-height: 0 !important;
+	padding: 0 !important;
+	margin: 0 !important;
+	overflow: hidden !important;
+}

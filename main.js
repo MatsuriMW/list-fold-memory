@@ -64,7 +64,11 @@ module.exports = class ListFoldMemory extends Plugin {
 		this.lfFx = StateEffect.define();        // 标记「这次折叠是插件自己发的」，免得又当成你手动折的写回文件
 
 		this.registerEditorExtension(this.editorExtension());
-		this.registerMarkdownPostProcessor((el, ctx) => this.readingView(el, ctx));
+		this.registerMarkdownPostProcessor((el, ctx) => {
+			// 阅读视图的装饰同样不能因为一个坏标记 / 坏结构把整篇渲染弄挂
+			try { this.readingView(el, ctx); }
+			catch (e) { console.error("[list-fold-memory] 阅读视图折叠失败，跳过这一块", e); }
+		});
 
 		this.addCommand({
 			id: "toggle-fold",
@@ -309,7 +313,7 @@ module.exports = class ListFoldMemory extends Plugin {
 			ignoreEvent() { return false; }
 		}
 
-		const build = (view) => {
+		const buildInner = (view) => {
 			const state = view.state;
 			const file = state.field(editorInfoField, false)?.file;
 			if (!file) return Decoration.none;
@@ -320,15 +324,18 @@ module.exports = class ListFoldMemory extends Plugin {
 			const wantFold = livePreview || plugin.settings.sourceFold;
 			const folded = plugin.foldedLines(view);   // 屏幕上正折着的行
 
-			// 一、标记行藏起来：连换行一起抹掉
+			// 一、标记行藏起来：用零高度的 line decoration，不再用 block replace。
+			//     block replace 在「标记紧跟在列表项下面」的结构里会把列表行合坏；
+			//     journal-tidy 整理后正是这种结构，会导致整篇笔记打不开。
+			//     line decoration 只改视觉，不动文档的行结构，标记和折叠都保留。
 			//     母项折起来了就不管 —— 整段都被原生折叠盖住了，再藏一次会跟它撞车
 			if (!plugin.reveal) {
 				for (const ln of attrLines) {
-					if (ln >= state.doc.lines) continue;
+					if (ln < 0 || ln >= state.doc.lines) continue;
 					if (folded.has(ln - 1)) continue;
 					const self = state.doc.line(ln + 1);
-					const next = ln + 2 <= state.doc.lines ? state.doc.line(ln + 2) : null;
-					decos.push(Decoration.replace({ block: true }).range(self.from, next ? next.from : self.to));
+					if (self.from >= state.doc.length) continue;   // 文末空行没有可装饰的行，跳过
+					decos.push(Decoration.line({ class: "lf-attr-hidden" }).range(self.from));
 				}
 			}
 
@@ -345,6 +352,15 @@ module.exports = class ListFoldMemory extends Plugin {
 			}
 
 			return decos.length ? Decoration.set(decos, true) : Decoration.none;
+		};
+
+		// 装饰只是锦上添花：算的时候出任何错都不该把整篇笔记的编辑器带崩（那样看起来就是「笔记打不开」）
+		const build = (view) => {
+			try { return buildInner(view); }
+			catch (e) {
+				console.error("[list-fold-memory] 生成折叠装饰失败，跳过这一次", e);
+				return Decoration.none;
+			}
 		};
 
 		// 用 ViewPlugin 而不是 StateField：要拿得到 view，才看得出哪一行正折着
