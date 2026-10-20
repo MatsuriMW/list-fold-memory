@@ -32,8 +32,9 @@ The folding itself is not drawn by this plugin — it calls the same CodeMirror 
 
 Marker and fold are kept in sync in both directions:
 
-- A marker in the file folds that item when the note opens.
-- Fold something yourself — ⌥S, the arrow at the left, whatever you already use — and the marker is written for you. Unfold it and the marker is removed.
+- A marker in the file folds that item when the note opens, and again whenever another plugin or a sync rewrites the file and the fold gets lost. This direction only ever folds; it never unfolds something for you.
+- Fold something yourself — ⌥S, the arrow at the left, whatever you already use — and the marker is written for you. Unfold it and the marker is removed. Typing and rewrites of the file don't count as folding, and folds that are off screen are read from the editor's state, not from what happens to be drawn.
+- Another plugin that folds on its own (say, to collapse a "done" section) can wrap that in `app.plugins.plugins["list-fold-memory"].quietly(() => …)`, and those folds are not recorded as yours.
 
 So the plugin's own button is optional. Fold the way you already do, and the state is kept anyway.
 

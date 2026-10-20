@@ -1,7 +1,7 @@
 {
   "id": "list-fold-memory",
   "name": "List Fold Memory",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "minAppVersion": "1.4.0",
   "description": "记住列表是怎么折叠的：折叠状态写在被折叠那项下面的一行 %% collapsed:: true %% 注释里（Logseq 的块属性写法），读的时候一个字都看不见，随手能清掉。跟着文件走，换设备 / git / 被 AI 重写都不会错位。",
   "author": "马自立",

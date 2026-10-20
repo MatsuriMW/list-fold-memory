@@ -11,12 +11,17 @@
  *
  * 写的是 Obsidian 的注释语法 %%…%%，所以这行东西平时一个字都看不见：
  *   · 阅读视图：Obsidian 自己就不渲染注释，天然没有
- *   · 编辑视图（实时预览 / 源码）：插件用编辑器装饰把整行连换行一起抹掉，
- *     光标也进不去（当一个原子跳过），打字撞不到它
+ *   · 编辑视图（实时预览 / 源码）：折着的时候它在折叠范围里；没折着时插件把它连同前面的换行一起替换掉，
+ *     看起来就是母项那一行到头了。光标进不去，落到它后面会被挪回母项行尾，打字撞不到它
  * 想彻底清干净：命令「清除本文所有折叠标记」，一下全删掉，还原成没装插件时的原文。
  *
  * 标记写在文件里，所以换设备 / git / 导出 / 被 AI 重写都跟着内容走，
  * 不会像外部存档那样错位配对。
+ *
+ * 折叠本身用的是 Obsidian 自己那套（CodeMirror 的折叠状态：⌥S、行首箭头、Bullet 用的都是它），两边这样通气：
+ *   · 标记 → 折叠：打开笔记时、文件被别的插件 / 同步改写后折叠丢了时，有标记的项补折上。只补折，不替你展开
+ *   · 折叠 → 标记：你手动折 / 展开之后（⌥S、点箭头、点 …），照编辑器里实际折没折，一次写好这几项的标记。
+ *     打字、文件被改写这类改正文的变动不算；别的插件折叠时用 quietly() 包住，就不会被当成你的操作记下来
  */
 
 "use strict";
@@ -25,18 +30,20 @@ const {
 	Plugin, PluginSettingTab, Setting, Notice, MarkdownView, TFile,
 	editorInfoField, editorLivePreviewField,
 } = require("obsidian");
-const { StateField, StateEffect } = require("@codemirror/state");
+const { StateField, StateEffect, EditorState, Annotation, Transaction } = require("@codemirror/state");
 const { EditorView, Decoration, WidgetType, ViewPlugin } = require("@codemirror/view");
 
-// 折叠直接走 Obsidian 自己的那条命令（⌥S 就是它），折出来的样子、行首那个箭头、
-// 点一下展开的手感全是原生的 —— 也不用去碰 CodeMirror 的内部模块，省得版本一变就失灵
-const FOLD_CMD = "editor:toggle-fold";
-const FOLD_MARK_CLASS = "cm-foldPlaceholder";   // Obsidian 折起来之后留在行尾的那个占位
+// Obsidian 的折叠就是 CodeMirror 的折叠状态：直接读写它，折出来跟 ⌥S 一模一样，也不用挪光标、不受屏幕范围限制
+let lang = null;
+try { lang = require("@codemirror/language"); } catch (e) { /* 拿不到就只管标记、不折叠 */ }
+const HAS_FOLD = !!(lang && lang.foldEffect && lang.unfoldEffect && lang.foldedRanges && lang.foldable);
+const OURS = Annotation.define();   // 插件自己发的折叠 / 改标记：不当成你的操作再记一遍
 
 const LIST_RE = /^([ \t]*)([-*+]|\d+[.)])([ \t]+|$)(.*)$/;          // 列表项：无序（- * +）和有序（1. 1)）一样看待
 const ATTR_RE = /^[ \t]*%%[ \t]*collapsed::[ \t]*true[ \t]*%%[ \t]*$/;   // 折叠标记那一行
 const FENCE_RE = /^[ \t]*(`{3,}|~{3,})/;                            // 代码块围栏：里面的「列表」不算
 const CALLOUT_RE = /^((?:>[ \t]?)+)/;                               // callout：> - a 里的列表照样认。只认行首的 >，且每个 > 后面最多吃一个空白，不能把列表自己的缩进吃掉
+const BLOCK_ID_RE = /^[ \t]*\^[A-Za-z0-9-]+[ \t]*$/;                 // 单独一行的块 ID（^q-gufz，制卡插件常这么写，多半顶格）：算上一项的
 const CHECKBOX_RE = /^\[[^\]]\][ \t]*/;                             // 复选框：勾没勾选不能影响指纹，先剥掉
 const MARKDOWN_RE = /(\*\*|__|[*_`~]{1,2}|!?\[\[|\]\]|!?\[|\]\([^)]*\)|\(\))/g;
 
@@ -51,6 +58,11 @@ const DEFAULTS = {
 	sourceFold: false,       // 源码模式也折叠（默认只藏标记，原文照样给你看）
 };
 
+// 你自己在改正文（打字、删、撤销、拖动）：这时候折叠跟着变不算「文件被改写」
+const isTyping = (tr) => ["input", "delete", "undo", "redo", "move", "drop"].some((ev) => tr.isUserEvent(ev));
+const foldCount = (state) => (HAS_FOLD ? lang.foldedRanges(state).size : 0);
+const isAttrLine = (text) => ATTR_RE.test(text.replace(CALLOUT_RE, ""));
+
 module.exports = class ListFoldMemory extends Plugin {
 
 	// ------------------------------------------------------------ 生命周期
@@ -59,9 +71,9 @@ module.exports = class ListFoldMemory extends Plugin {
 		this.cache = new Map();      // 文件路径 → 解析结果（按内容缓存，打字不会反复重算）
 		this.rawCache = new Map();   // 文件路径 → 正文文本（阅读视图要用，那里没有编辑器）
 		this.reveal = false;         // 「临时露出折叠标记」
+		this.quiet = 0;              // >0 时别的插件正在折叠（见 quietly）：这期间的折叠变化不记
 		this.settings = Object.assign({}, DEFAULTS, await this.loadData());
 		this.refreshFx = StateEffect.define();   // 重画编辑器装饰
-		this.lfFx = StateEffect.define();        // 标记「这次折叠是插件自己发的」，免得又当成你手动折的写回文件
 
 		this.registerEditorExtension(this.editorExtension());
 		this.registerMarkdownPostProcessor((el, ctx) => {
@@ -73,17 +85,24 @@ module.exports = class ListFoldMemory extends Plugin {
 		this.addCommand({
 			id: "toggle-fold",
 			name: "折叠 / 展开光标所在的列表项",
-			checkCallback: (checking) => this.pickCursorItem(checking, (it) => this.flipItems([it], !it.folded)),
+			checkCallback: (checking) => this.pickCursorItem(checking, (it, ctx) => this.flipItems([it], !this.shownFolded(ctx, it))),
 		});
 		this.addCommand({
 			id: "collapse-all",
 			name: "折叠本文所有列表项",
-			checkCallback: (checking) => this.pickDoc(checking, (items) => this.flipItems(items.filter((i) => i.childCount && !i.folded), true)),
+			checkCallback: (checking) => this.pickDoc(checking, (items, ctx) => {
+				this.flipItems(items.filter((i) => i.childCount && !i.folded), true);
+				if (ctx.cm) this.applyFolds(ctx.cm);   // 有标记却没折着的也补上
+			}),
 		});
 		this.addCommand({
 			id: "expand-all",
 			name: "展开本文所有列表项",
-			checkCallback: (checking) => this.pickDoc(checking, (items) => this.flipItems(items.filter((i) => i.folded), false)),
+			checkCallback: (checking) => this.pickDoc(checking, (items, ctx) => {
+				const marked = items.filter((i) => i.folded);
+				if (marked.length) this.flipItems(marked, false);
+				if (ctx.cm) this.applyFolds(ctx.cm, true);   // 没有标记、但折着的（比如日记整理收起的 DONE 区）也展开
+			}),
 		});
 		this.addCommand({
 			id: "collapse-top-level",
@@ -107,10 +126,7 @@ module.exports = class ListFoldMemory extends Plugin {
 
 		this.addSettingTab(new FoldSettingTab(this.app, this));
 
-		this.registerEvent(this.app.vault.on("modify", (file) => {
-			this.cache.delete(file.path);
-			this.rawCache.delete(file.path);
-		}));
+		this.registerEvent(this.app.vault.on("modify", (file) => this.forget(file)));
 
 		// 切到另一个窗格 / 打开一篇笔记时，按标记把该折的折上
 		this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
@@ -127,6 +143,18 @@ module.exports = class ListFoldMemory extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 		this.refreshAll();
+	}
+
+	// 给别的插件用：fn 里发生的折叠 / 展开不写成标记（比如日记整理收起 DONE 区）。fn 里的折叠要是同步发出的
+	quietly(fn) {
+		this.quiet++;
+		try { return fn(); }
+		finally { this.quiet--; }
+	}
+
+	forget(file) {
+		this.cache.delete(file.path);
+		this.rawCache.delete(file.path);
 	}
 
 	// ------------------------------------------------------------ 上下文
@@ -194,6 +222,87 @@ module.exports = class ListFoldMemory extends Plugin {
 		return (it.callout || "") + it.rawIndent + this.unitOf(parsed, it);
 	}
 
+	// ------------------------------------------------------------ 编辑器里的折叠状态
+
+	// 从这一项起头的折叠：起点在母项那一行，或者在它下面的标记行（标记是后插进去的，折叠会被挤到标记行后面）
+	foldsOf(state, it) {
+		if (!HAS_FOLD) return [];
+		const doc = state.doc;
+		const head = doc.line(it.line + 1);
+		const to = it.folded && it.line + 2 <= doc.lines ? doc.line(it.line + 2).to : head.to;
+		const out = [];
+		lang.foldedRanges(state).between(head.from, to, (f, t) => { if (f >= head.from && f <= to) out.push({ from: f, to: t }); });
+		return out;
+	}
+
+	// 屏幕上这一项是不是折着（不管有没有标记）
+	shownFolded(ctx, it) {
+		return ctx.cm && HAS_FOLD ? this.foldsOf(ctx.cm.state, it).length > 0 : it.folded;
+	}
+
+	// 这一项按 Obsidian 自己的规则该折哪一段（跟 ⌥S 一样）；问不到就从行尾折到最后一个子孙
+	nativeRange(state, it) {
+		const doc = state.doc;
+		const head = doc.line(it.line + 1);
+		let r = null;
+		try { r = lang.foldable(state, head.from, head.to); } catch (e) { r = null; }
+		const last = doc.line(Math.min(it.end, doc.lines - 1) + 1);
+		// 原生范围停在顶格的块 ID 行前面时，延到这一项真正的末尾
+		if (r && r.from >= head.from && r.to > r.from) return last.to > r.to ? { from: r.from, to: last.to } : r;
+		return last.to > head.to ? { from: head.to, to: last.to } : null;
+	}
+
+	// 标记 → 折叠：有标记却没折着的折上。unfold 为真时（只有「展开本文所有列表项」这种明确的操作），没标记却折着的也展开
+	applyFolds(view, unfold) {
+		if (!HAS_FOLD || !view || !view.state || !view.dom || !view.dom.isConnected) return;
+		const state = view.state;
+		const file = state.field(editorInfoField, false)?.file;
+		if (!file) return;
+		// 源码模式（没开「源码模式下也折叠」）不折，标记只由装饰藏起来
+		if (!state.field(editorLivePreviewField, false) && !this.settings.sourceFold) return;
+		const parsed = this.doc(file, state.doc.toString());
+		const effects = [];
+		for (const it of parsed.items) {
+			if (!it.childCount) continue;
+			const have = this.foldsOf(state, it);
+			if (it.folded) {
+				const want = this.nativeRange(state, it);
+				if (!want || have.some((r) => r.from === want.from && r.to >= want.to)) continue;   // 已经折对了（⌥S 折出来的范围可能短一截，漏了末尾的块 ID 行）
+				for (const r of have) effects.push(lang.unfoldEffect.of(r));      // 折歪了的（起点在标记行后面）先拆掉
+				effects.push(lang.foldEffect.of(want));
+			} else if (unfold) {
+				for (const r of have) effects.push(lang.unfoldEffect.of(r));
+			}
+		}
+		if (effects.length) view.dispatch({ effects, annotations: OURS.of(true) });
+	}
+
+	// 折叠 → 标记：positions 是你刚折 / 展开的那几处折叠起点。照编辑器里现在实际折没折，一次写好这几项的标记
+	recordFolds(view, positions) {
+		const state = view.state;
+		const file = state.field(editorInfoField, false)?.file;
+		if (!file) return;
+		const parsed = this.doc(file, state.doc.toString());
+		const on = [], off = [], seen = new Set();
+		for (const pos of positions) {
+			if (pos == null || pos < 0 || pos > state.doc.length) continue;
+			const ln = state.doc.lineAt(pos).number - 1;
+			const it = parsed.items.find((x) => x.childCount && (x.line === ln || (x.folded && x.line + 1 === ln)));
+			if (!it || seen.has(it)) continue;
+			seen.add(it);
+			const now = this.foldsOf(state, it).length > 0;
+			if (now && !it.folded) on.push(it);
+			else if (!now && it.folded) off.push(it);
+		}
+		if (!on.length && !off.length) { if (seen.size) this.applyFolds(view); return; }   // 标记早就有了：只把范围扶正
+		const edits = [...this.attrEdits(state.doc, parsed, on, true), ...this.attrEdits(state.doc, parsed, off, false)].sort((a, b) => a.from - b.from);
+		if (!edits.length) return;
+		// 标记不进撤销历史：⌘Z 撤的是你写的字，不是折叠记录
+		view.dispatch({ changes: edits, annotations: [OURS.of(true), Transaction.addToHistory.of(false)] });
+		this.forget(file);
+		if (on.length) this.applyFolds(view);   // 新标记插在折叠起点上，会把折叠挤到标记行后面：按原生范围扶正
+	}
+
 	// ------------------------------------------------------------ 改标记
 
 	// ctxOverride：从某个具体的编辑器现场传进来（比如那个窗格不是当前活动的那个）
@@ -208,40 +317,42 @@ module.exports = class ListFoldMemory extends Plugin {
 
 		if (ctx.cm) {
 			// 编辑器里改：不碰磁盘、不弹重载、⌘Z 能撤销
-			const { Transaction } = require("@codemirror/state");
-			const edits = this.attrEdits(ctx.cm.state.doc, parsed, sorted, fold);
-			if (!edits.length) return;
-			ctx.cm.dispatch({ changes: edits, annotations: Transaction.addToHistory.of(true) });
+			const view = ctx.cm;
+			// 展开：先拆编辑器里的折叠，再删标记（先删标记就认不出折叠是从哪一项起头的了）
+			if (!fold && HAS_FOLD) {
+				const effects = [];
+				for (const it of sorted) for (const r of this.foldsOf(view.state, it)) effects.push(lang.unfoldEffect.of(r));
+				if (effects.length) view.dispatch({ effects, annotations: OURS.of(true) });
+			}
+			const edits = this.attrEdits(view.state.doc, parsed, sorted, fold);
+			if (edits.length) view.dispatch({ changes: edits, annotations: [OURS.of(true), Transaction.addToHistory.of(true)] });
+			this.forget(ctx.file);
+			if (fold) this.applyFolds(view);   // 标记写好了：照标记真的折起来
 		} else {
 			// 阅读视图：直接改文件，Obsidian 会自己重渲染
 			let text = ctx.text;
 			for (const it of sorted) text = setAttrLine(text, it.line, fold, this.padOf(parsed, it));
 			this.app.vault.modify(ctx.file, text);
+			this.forget(ctx.file);
 		}
-		this.cache.delete(ctx.file.path);
-		this.rawCache.delete(ctx.file.path);
 		this.refresh(ctx.file);
-		// 标记写好了：让 Obsidian 真的折起来（走 ⌥S 那条命令）
-		if (ctx.cm) this.applyFolds(ctx.cm);
 		if (fold) new Notice(`折叠了 ${targets.length} 项`);
 	}
 
+	// 写 / 删标记行。只动真有（或真没有）标记的那一行：下面那行不是标记就绝不删，已经有了就不重复插
 	attrEdits(doc, parsed, targets, fold) {
 		const edits = [];
 		for (const it of targets) {
+			const a = it.line + 1;                                   // 标记行（0 起）
+			const has = a < doc.lines && isAttrLine(doc.line(a + 1).text);
 			if (fold) {
+				if (has) continue;
 				const at = doc.line(it.line + 1).to;
 				edits.push({ from: at, to: at, insert: "\n" + this.padOf(parsed, it) + ATTR_TEXT });
 			} else {
-				// 删标记行要连它前面的换行一起删，不留空行；它是全文最后一行时只删自己
-				const a = it.line + 1;
-				if (a >= doc.lines) continue;
-				const self = doc.line(a + 1);
-				let from = self.from;
-				let to = self.to;
-				if (a > 0) from = doc.line(a).to;
-				else if (doc.lines > 1) to = doc.line(2).from;
-				edits.push({ from, to, insert: "" });
+				if (!has) continue;
+				// 删标记行要连它前面的换行一起删，不留空行
+				edits.push({ from: doc.line(a).to, to: doc.line(a + 1).to, insert: "" });
 			}
 		}
 		edits.sort((x, y) => x.from - y.from);
@@ -252,20 +363,22 @@ module.exports = class ListFoldMemory extends Plugin {
 		const ctx = this.activeCtx();
 		if (!ctx || ctx.text == null) return;
 		const lines = ctx.text.split("\n");
-		const kept = lines.filter((l) => !ATTR_RE.test(l));
-		const removed = lines.length - kept.length;
-		if (!removed) { new Notice("本文没有折叠标记"); return; }
-		const text = kept.join("\n");
+		const hits = [];
+		lines.forEach((l, i) => { if (isAttrLine(l)) hits.push(i); });
+		if (!hits.length) { new Notice("本文没有折叠标记"); return; }
 		if (ctx.cm) {
-			const { Transaction } = require("@codemirror/state");
-			ctx.cm.dispatch({ changes: { from: 0, to: ctx.cm.state.doc.length, insert: text }, annotations: Transaction.addToHistory.of(true) });
+			// 一行一行删，别整篇替换：整篇替换会把编辑器里所有折叠一起冲掉
+			const doc = ctx.cm.state.doc;
+			const changes = hits.map((i) => (i > 0
+				? { from: doc.line(i).to, to: doc.line(i + 1).to, insert: "" }
+				: { from: 0, to: Math.min(doc.length, doc.line(1).to + 1), insert: "" }));
+			ctx.cm.dispatch({ changes, annotations: [OURS.of(true), Transaction.addToHistory.of(true)] });
 		} else {
-			this.app.vault.modify(ctx.file, text);
+			this.app.vault.modify(ctx.file, lines.filter((l) => !isAttrLine(l)).join("\n"));
 		}
-		this.cache.delete(ctx.file.path);
-		this.rawCache.delete(ctx.file.path);
+		this.forget(ctx.file);
 		this.refresh(ctx.file);
-		new Notice(`清掉 ${removed} 行折叠标记，原文还原了`);
+		new Notice(`清掉 ${hits.length} 行折叠标记，原文还原了`);
 	}
 
 	// ------------------------------------------------------------ 刷新
@@ -313,37 +426,42 @@ module.exports = class ListFoldMemory extends Plugin {
 			ignoreEvent() { return false; }
 		}
 
-		const buildInner = (view) => {
-			const state = view.state;
+		const HIDE = Decoration.replace({ lfHide: true });
+
+		const buildInner = (state) => {
 			const file = state.field(editorInfoField, false)?.file;
 			if (!file) return Decoration.none;
-			const livePreview = !!state.field(editorLivePreviewField, false);
-			const parsed = plugin.doc(file, state.doc.toString());
-			const { items, attrLines } = parsed;
+			const doc = state.doc;
+			const parsed = plugin.doc(file, doc.toString());
+			// 源码模式（没开「源码模式下也折叠」）Obsidian 不画折叠：折叠状态还在（从实时预览带过来的），但屏幕上是全展开的，不能拿它当「已经盖住了」
+			const wantFold = !!state.field(editorLivePreviewField, false) || plugin.settings.sourceFold;
+			const folds = HAS_FOLD && wantFold ? lang.foldedRanges(state) : null;
+			const covered = (from, to) => {
+				let hit = false;
+				if (folds) folds.between(from, to, (a, b) => { if (a <= from && b >= to) hit = true; });
+				return hit;
+			};
 			const decos = [];
-			const wantFold = livePreview || plugin.settings.sourceFold;
-			const folded = plugin.foldedLines(view);   // 屏幕上正折着的行
 
-			// 一、标记行藏起来：用零高度的 line decoration，不再用 block replace。
-			//     block replace 在「标记紧跟在列表项下面」的结构里会把列表行合坏；
-			//     journal-tidy 整理后正是这种结构，会导致整篇笔记打不开。
-			//     line decoration 只改视觉，不动文档的行结构，标记和折叠都保留。
-			//     母项折起来了就不管 —— 整段都被原生折叠盖住了，再藏一次会跟它撞车
+			// 一、标记行：连同它前面的换行一起替换掉，母项那一行看起来就到头了；光标进不去（见下面 atomicRanges 和 snap）。
+			//     这种替换跨了换行，所以必须由 StateField 直接提供 —— ViewPlugin 给的跨行替换 CodeMirror 不认，整个编辑器会挂。
+			//     已经在折叠范围里的不用再管
 			if (!plugin.reveal) {
-				for (const ln of attrLines) {
-					if (ln < 0 || ln >= state.doc.lines) continue;
-					if (folded.has(ln - 1)) continue;
-					const self = state.doc.line(ln + 1);
-					if (self.from >= state.doc.length) continue;   // 文末空行没有可装饰的行，跳过
-					decos.push(Decoration.line({ class: "lf-attr-hidden" }).range(self.from));
+				for (const ln of parsed.attrLines) {
+					if (ln >= doc.lines) continue;
+					const self = doc.line(ln + 1);
+					const from = ln > 0 ? doc.line(ln).to : self.from;
+					if (self.to <= from || covered(from, self.to)) continue;
+					decos.push(HIDE.range(from, self.to));
 				}
 			}
 
 			// 二、展开着的项：鼠标划过去时行尾那个折叠按钮
-			if (wantFold && plugin.settings.hoverHandle) {
-				for (const it of items) {
-					if (!it.childCount || ancestorFolded(it) || folded.has(it.line)) continue;
-					const head = state.doc.line(it.line + 1);
+			if (HAS_FOLD && wantFold && plugin.settings.hoverHandle) {
+				for (const it of parsed.items) {
+					if (!it.childCount || it.folded) continue;
+					const head = doc.line(it.line + 1);
+					if (covered(head.to, head.to)) continue;   // 自己折着，或者在折着的母项里
 					decos.push(Decoration.widget({
 						widget: new HoverHandle(it.descCount, plugin.keyOf(file, it)),
 						side: 1,
@@ -355,121 +473,127 @@ module.exports = class ListFoldMemory extends Plugin {
 		};
 
 		// 装饰只是锦上添花：算的时候出任何错都不该把整篇笔记的编辑器带崩（那样看起来就是「笔记打不开」）
-		const build = (view) => {
-			try { return buildInner(view); }
+		const build = (state) => {
+			try { return buildInner(state); }
 			catch (e) {
 				console.error("[list-fold-memory] 生成折叠装饰失败，跳过这一次", e);
 				return Decoration.none;
 			}
 		};
 
-		// 用 ViewPlugin 而不是 StateField：要拿得到 view，才看得出哪一行正折着
-		const decoPlugin = ViewPlugin.fromClass(class {
-			constructor(view) { this.decorations = build(view); }
-			update(u) {
-				// 折起来 / 展开之后画面变了，装饰要跟着重画（标记行该不该藏、按钮还该不该在）
-				if (u.docChanged || u.viewportChanged || u.transactions.length) this.decorations = build(u.view);
-			}
-		}, {
-			decorations: (v) => v.decorations,
-			// 藏起来的标记行也当成一个原子：光标直接跳过，不可能停进去把它打坏
-			provide: (p) => EditorView.atomicRanges.of((view) => (view.plugin(p) ? view.plugin(p).decorations : Decoration.none)),
+		const isLP = (state) => !!state.field(editorLivePreviewField, false);
+		const field = StateField.define({
+			create: build,
+			update(value, tr) {
+				const foldMoved = HAS_FOLD && lang.foldedRanges(tr.startState) !== lang.foldedRanges(tr.state);
+				if (tr.docChanged || foldMoved || isLP(tr.startState) !== isLP(tr.state) || tr.effects.some((e) => e.is(plugin.refreshFx))) return build(tr.state);
+				return value;
+			},
+			provide: (f) => [
+				EditorView.decorations.from(f),
+				// 藏起来的标记行是一个原子：光标直接跳过，不可能停进去把它打坏
+				EditorView.atomicRanges.of((view) => view.state.field(f, false) || Decoration.none),
+			],
 		});
 
-		return [decoPlugin, ...this.foldSyncExtension()];
+		// 光标落到藏起来那段的后头（视觉上跟母项行尾是同一个位置）就挪回母项行尾：在那儿打字才是接着母项写，不会写进标记行。
+		// 从母项行尾往右走的那一下例外，直接去下一行行首
+		const snap = EditorState.transactionFilter.of((tr) => {
+			const decos = tr.startState.field(field, false);
+			if (!decos) return tr;
+			// 改动把藏起来的标记行拆了半截，或者把它拼进了别的行（母项行尾往后删时 Obsidian 会把「母项 + 标记行」整段换成拼好的一行；
+			// 子项行首退格会把子项接到标记行后面）：标记行要么整行在、要么整行没有，坏一半就成了露出来的乱码。
+			// 这种改动换成「只把这一段标记删掉」—— 这一项本来就展开着，等于不再记它折叠；再按一次才是原来那个操作
+			// 只管你在光标处按键引起的改动（打字、删除，或者 Obsidian 列表命令这种带着光标的）：文件被日记整理 / 同步改写后
+			// 同步进编辑器的那次改动不能拦，拦了编辑器就跟文件对不上了
+			const cur = tr.startState.selection.main.head;
+			const byKey = tr.isUserEvent("input") || tr.isUserEvent("delete") || !!tr.selection;
+			if (tr.docChanged && byKey && !tr.annotation(OURS)) {
+				let hit = null;
+				tr.changes.iterChanges((fA, tA, fB, tB, ins) => {
+					if (hit || cur < fA || cur > tA) return;   // 这处改动没碰到光标
+					decos.between(Math.max(0, fA - 1), tA, (from, to, d) => {
+						if (hit || !d.spec.lfHide) return;
+						const inside = fA < to && tA > from;          // 动到了藏起来那段里面
+						const eatsTail = fA === to && tA > to;        // 删掉了标记行后面的换行，下一行会接上来
+						if (!inside && !eatsTail) return;
+						const whole = fA <= from && tA >= to && !/collapsed::/.test(ins.toString());   // 整段一起删掉、没再写回来：照常
+						if (!whole) hit = { from, to };
+					});
+				});
+				if (!hit) return tr;
+				return { changes: { from: hit.from, to: hit.to }, selection: { anchor: hit.from }, userEvent: "delete", scrollIntoView: true };
+			}
+			if (!tr.selection || tr.docChanged) return tr;
+			const sel = tr.selection;
+			if (sel.ranges.length !== 1 || !sel.main.empty) return tr;
+			const head = sel.main.head;
+			let hit = null;
+			decos.between(head, head, (from, to, d) => { if (d.spec.lfHide && to === head && from < to) hit = { from, to }; });
+			if (!hit) return tr;
+			const prev = tr.startState.selection.main.head;
+			const pos = prev === hit.from && hit.to < tr.startState.doc.length ? hit.to + 1 : hit.from;
+			return [tr, { selection: { anchor: pos }, sequential: true }];
+		});
+
+		this.markField = field;   // 排错用：view.state.field(plugin.markField) 是当前藏起来的标记行
+		return [field, snap, this.foldSyncExtension()];
 	}
 
 	// ------------------------------------------------------------ 跟 Obsidian 自带折叠互相通气
 
-	// 双向：文件里的标记 → 折起来；你按 ⌥S（或点行首箭头）折 / 展开 → 写进文件。
-	// 所以日常根本不用碰这个插件的按钮，怎么折叠都记得住
 	foldSyncExtension() {
 		const plugin = this;
-		return [ViewPlugin.fromClass(class {
+		return ViewPlugin.fromClass(class {
 			constructor(view) {
-				this.seen = new Set();
-				// 打开笔记：按文件里的标记把该折的折上。
-				// 视图刚建好时 live preview 的 StateField 有时还没就绪，applyFolds 会以为在源码模式直接返回，
-				// 所以下一帧再补一次，半秒后再兜一次（源码模式那两次都会安全地什么都不做）
-				const run = () => {
-					if (!view.dom || !view.dom.isConnected) return;
-					this.seen = plugin.foldedLines(view);
-					plugin.applyFolds(view);
-				};
-				setTimeout(run, 0);
-				setTimeout(run, 500);
+				this.view = view;
+				this.pending = [];   // 你刚折 / 展开的折叠起点，等这一轮更新画完一起记
+				this.lost = false;   // 文件被改写、折叠跟着丢了：按标记补回来
+				this.timer = 0;
+				this.settle();
 			}
+
+			// 刚打开一篇笔记：按标记补折。live preview 有时还没就绪、Obsidian 也会稍后恢复它自己记的折叠，
+			// 所以过一会儿再补两次；这段时间里的折叠变化是「恢复」不是你的操作，不记
+			settle() {
+				this.calmUntil = Date.now() + 1500;
+				for (const ms of [0, 300, 1200]) setTimeout(() => plugin.applyFolds(this.view), ms);
+			}
+
 			update(u) {
-				// 打字会让行号整体挪位，这时候看到的「折叠变了」不算数，重新记一份就好
-				if (u.docChanged) { this.seen = plugin.foldedLines(u.view); return; }
-				if (!u.transactions.length || this.busy) return;
-				// 折叠的进出是纯状态变化。等画面画完再看一眼：多出来的是你折的，没了的是你展开的
-				this.busy = true;
-				setTimeout(() => {
-					this.busy = false;
-					const now = plugin.foldedLines(u.view);
-					for (const ln of now) if (!this.seen.has(ln)) plugin.noteFoldLine(u.view, ln, true);
-					for (const ln of this.seen) if (!now.has(ln)) plugin.noteFoldLine(u.view, ln, false);
-					this.seen = now;
-				}, 0);
+				if (!HAS_FOLD) return;
+				for (const tr of u.transactions) {
+					if (tr.docChanged) {
+						this.pending = this.pending.map((p) => tr.changes.mapPos(p, -1));
+						let whole = false;
+						tr.changes.iterChangedRanges((fA, tA) => { if (fA === 0 && tA === tr.startState.doc.length) whole = true; });
+						if (whole && tr.startState.doc.length) { this.settle(); continue; }   // 整篇换掉 = 换了一篇笔记 / 重新载入
+						if (!tr.annotation(OURS) && !isTyping(tr) && foldCount(tr.state) < foldCount(tr.startState)) this.lost = true;
+						continue;
+					}
+					if (tr.annotation(OURS) || plugin.quiet || Date.now() < this.calmUntil) continue;
+					for (const e of tr.effects) {
+						if (e.is(lang.foldEffect) || e.is(lang.unfoldEffect)) this.pending.push(e.value.from);
+					}
+				}
+				if ((this.pending.length || this.lost) && !this.timer) {
+					// 不能在这一轮更新里再改文档：等它画完
+					this.timer = setTimeout(() => {
+						this.timer = 0;
+						const ps = this.pending, lost = this.lost;
+						this.pending = [];
+						this.lost = false;
+						if (!this.view.dom.isConnected) return;
+						try {
+							if (ps.length) plugin.recordFolds(this.view, ps);
+							if (lost) plugin.applyFolds(this.view);
+						} catch (e) { console.error("[list-fold-memory] 同步折叠失败", e); }
+					}, 0);
+				}
 			}
-		})];
-	}
 
-	// 屏幕上正折着哪些行：看 Obsidian 折完留在行尾的那个占位（⌥S 折完也是它）
-	foldedLines(view) {
-		const out = new Set();
-		if (!view || !view.dom) return out;
-		const doc = view.state.doc;
-		const marks = view.dom.querySelectorAll("." + FOLD_MARK_CLASS);
-		for (const el of marks) {
-			let pos = -1;
-			try { pos = view.posAtDOM(el); } catch (e) { continue; }
-			if (pos < 0 || pos > doc.length) continue;
-			out.add(doc.lineAt(pos).number - 1);
-		}
-		return out;
-	}
-
-	// 按文件里的标记，把该折的折上、该展开的展开 —— 走的就是 ⌥S 那条命令本身
-	async applyFolds(view, force) {
-		if (!view || !view.dom || !view.dom.isConnected) return;
-		// 命令只作用在当前的窗格上，别的窗格别乱动
-		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!force && (!active || !active.editor || active.editor.cm !== view)) return;
-		const state = view.state;
-		const file = state.field(editorInfoField, false)?.file;
-		if (!file) return;
-		const wantFold = !!state.field(editorLivePreviewField, false) || this.settings.sourceFold;
-		// 源码模式（没开「源码模式下也折叠」）：不折也不展开，标记留着只由装饰藏起来。
-		// 以前这里会按 wantFold=false 把已折的项展开，再经 noteFoldLine 把标记写没；
-		// 视图刚建好、live preview 还没就绪的那一瞬也会被误判成源码模式，标记就这样丢了。
-		if (!wantFold) return;
-		const items = this.doc(file, state.doc.toString()).items;
-		const targets = items.filter((it) => it.childCount && !ancestorFolded(it));
-		if (!targets.length) return;
-		const sel = state.selection;
-		const scroll = view.scrollDOM ? view.scrollDOM.scrollTop : 0;
-		for (const it of targets) {
-			// 每动一次都重看一眼：光标挪过去之后这一项才进画面，才看得见它折没折
-			const folded = this.foldedLines(view).has(it.line);
-			const want = !!(it.folded && wantFold);
-			if (folded === want) continue;
-			view.dispatch({ selection: { anchor: state.doc.line(it.line + 1).from } });
-			await this.app.commands.executeCommandById(FOLD_CMD);
-		}
-		if (view.scrollDOM) view.scrollDOM.scrollTop = scroll;
-		view.dispatch({ selection: sel, effects: this.lfFx.of(null) });
-	}
-
-	// 你手动折 / 展开了：把这一项对应的标记行写上或删掉
-	noteFoldLine(view, line, wantFold) {
-		const state = view.state;
-		const file = state.field(editorInfoField, false)?.file;
-		if (!file) return;
-		const it = this.doc(file, state.doc.toString()).items.find((x) => x.line === line && x.childCount > 0);
-		if (!it || it.folded === wantFold) return;
-		this.flipItems([it], wantFold, { file, cm: view, text: state.doc.toString() });
+			destroy() { clearTimeout(this.timer); }
+		});
 	}
 
 	keyOf(file, it) {
@@ -601,6 +725,11 @@ function parseDoc(text) {
 				stack.length = 0;
 				continue;
 			}
+			// 单独一行的块 ID：哪怕顶格，Markdown 也当它是上一段的续行（还在这一项里），折叠时一起收进去，列表不在这儿断
+			if (BLOCK_ID_RE.test(body)) {
+				if (i > top.item.end) top.item.end = i;
+				continue;
+			}
 			// 缩进的普通文字：算进母项的范围
 			if (indentWidth(body) > top.indent) {
 				if (i > top.item.end) top.item.end = i;
@@ -636,10 +765,6 @@ function parseDoc(text) {
 		if (owner && owner.childCount > 0) owner.folded = true;
 	}
 
-	// 哪些标记行已经跟着母项一起被替换掉了：那几行不用再单独藏一次，否则两条装饰叠在同一个地方
-	const covered = new Set();
-	for (const it of items) if (it.folded && !ancestorFolded(it)) covered.add(it.line + 1);
-
 	// 这个文件习惯怎么缩进：母项/子项的缩进差取最小值，知道基准别科
 	let unit = 0;
 	let prev = null;
@@ -653,17 +778,7 @@ function parseDoc(text) {
 		prev = it.indent;
 	}
 
-	return { items, attrLines, covered, unit: unit || TAB_SIZE, useTab };
-}
-
-// 往上有没有任何一个祖先是折叠着的（有就轮不到这一项自己出装饰）
-function ancestorFolded(it) {
-	let p = it.parent;
-	while (p) {
-		if (p.folded) return true;
-		p = p.parent;
-	}
-	return false;
+	return { items, attrLines, unit: unit || TAB_SIZE, useTab };
 }
 
 // 向上汇总范围和子孙数
@@ -722,7 +837,7 @@ function hash32(s) {
 // 在某一项下面加上 / 删掉标记行（幂等：已经有了不重复插）
 function setAttrLine(text, line, fold, pad) {
 	const lines = text.split("\n");
-	const has = ATTR_RE.test(lines[line + 1] || "");
+	const has = isAttrLine(lines[line + 1] || "");
 	if (fold && !has) lines.splice(line + 1, 0, pad + ATTR_TEXT);
 	if (!fold && has) lines.splice(line + 1, 1);
 	return lines.join("\n");
