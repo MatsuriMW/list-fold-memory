@@ -1,5 +1,8 @@
 # List Fold Memory（列表折叠记忆）
 
+> [!IMPORTANT]
+> **本仓库已归档，不再更新。** 后续版本是 [Logseq Style Fold](https://github.com/MatsuriMW/logseq-style-fold)：功能全部保留，默认写 Logseq 的 `collapsed:: true`，也可以选 `%% collapsed:: true %%`、`<!-- collapsed:: true -->` 或自定义标记。这里写下的 `%% collapsed:: true %%` 新插件照样认，直接换过去就行。
+
 > **列表怎么折叠的，关掉笔记再打开还是那样。**
 
 一个 Obsidian 插件：把列表每一次折叠的状态记住。做法不是存到插件自己的文件里，而是在笔记里写一行注释。

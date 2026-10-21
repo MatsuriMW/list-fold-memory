@@ -1,5 +1,8 @@
 # List Fold Memory（列表折叠记忆）
 
+> [!IMPORTANT]
+> **This repository is archived and no longer updated.** Its successor is [Logseq Style Fold](https://github.com/MatsuriMW/logseq-style-fold): every feature is kept, it writes Logseq's `collapsed:: true` by default, and you can choose `%% collapsed:: true %%`, `<!-- collapsed:: true -->` or a custom marker instead. Markers written by this plugin (`%% collapsed:: true %%`) are still recognised, so you can switch directly.
+
 > **Your lists stay folded the way you left them.**
 
 An Obsidian plugin that remembers how each list item was collapsed, by writing one comment line into the note instead of keeping the state somewhere outside it.
